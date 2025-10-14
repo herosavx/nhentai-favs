@@ -218,7 +218,6 @@ fn extract_image_extension(url: &str) -> String {
 }
 
 // =================Database Stuff==========
-
 fn init_db(db_path: &str) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.execute(
@@ -238,7 +237,7 @@ fn init_db(db_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn export_db_to_text(db_path: &str, out_path: &str) -> Result<(), String> {
+fn export_db_to_csv(db_path: &str, out_path: &str) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("SELECT * FROM books ORDER BY id").map_err(|e| e.to_string())?;
     
@@ -255,16 +254,33 @@ fn export_db_to_text(db_path: &str, out_path: &str) -> Result<(), String> {
         })
     }).map_err(|e| e.to_string())?;
 
-    let mut output = String::new();
+    let mut wtr = csv::Writer::from_path(out_path).map_err(|e| e.to_string())?;
+    wtr.write_record(&[
+        "id",
+        "title_1",
+        "title_2",
+        "artists",
+        "groups",
+        "tags",
+        "languages",
+        "pages",
+    ]).map_err(|e| e.to_string())?;
+
     for book_result in books {
         let book = book_result.map_err(|e| e.to_string())?;
-        output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\tp-{}\n",
-            book.id, book.title_1, book.title_2, book.artists, book.groups, book.tags, book.languages, book.pages
-        ));
+        wtr.write_record(&[
+            book.id.to_string(),
+            book.title_1,
+            book.title_2,
+            book.artists,
+            book.groups,
+            book.tags,
+            book.languages,
+            book.pages.to_string(),
+        ]).map_err(|e| e.to_string())?;
     }
 
-    std::fs::write(out_path, output).map_err(|e| e.to_string())?;
+    wtr.flush().map_err(|e| e.to_string())?;
     println!("[+] Exported database to {}", out_path);
     Ok(())
 }
@@ -340,16 +356,16 @@ fn parse_page_range(value: &str) -> Result<RangeInclusive<u32>, String> {
 /// Command-line tool for exporting nhentai favorite list
 struct NhentaiFavsArgs {
     /// whether to download thumbnail image (default: false)
-    #[argh(switch, short = 'c')]
-    cover: bool,
+    #[argh(switch, short = 't')]
+    thumbnail: bool,
 
     /// page range to fetch data from (e.g., 1-20, 1-1)
-    #[argh(option, short = 'r', from_str_fn(parse_page_range))]
+    #[argh(option, short = 'p', from_str_fn(parse_page_range))]
     page_range: Option<RangeInclusive<u32>>,
 
-    /// convert existing database to plain text format in outpath, ignores other options except outpath
-    #[argh(switch, short = 't')]
-    cvt_text: bool,
+    /// convert existing database to csv format in outpath. no network operation performed.
+    #[argh(switch, short = 'c')]
+    cvt_csv: bool,
 
     /// output directory, may contain existing database
     #[argh(option, short = 'o')]
@@ -444,8 +460,6 @@ async fn process_single_book(
     let html_buf = html_res?;
     let book_data = parse_book_page(&html_buf, url)?;
 
-    println!("{:#?}\n", book_data);
-
     if let Ok(conn) = Connection::open(db_path) {
         save_book_to_db(&conn, &book_data, &ext)?;
     }
@@ -457,10 +471,10 @@ async fn process_single_book(
 async fn main() -> Result<(), String> {
     let args: NhentaiFavsArgs = argh::from_env();
 
-    if args.cvt_text {
+    if args.cvt_csv {
         let db_path = format!("{}/{}", args.outpath, SQ_DB_FILE);
         if Path::new(&db_path).exists() {
-            export_db_to_text(&db_path, &format!("{}/nfavs_export.txt", args.outpath))?;
+            export_db_to_csv(&db_path, &format!("{}/nfavs_export.csv", args.outpath))?;
         } else {
             println!("[-] Database not found at {}", db_path);
         }
@@ -502,7 +516,7 @@ async fn main() -> Result<(), String> {
             let resp = client.get(&page_url).send().await.map_err(|e| e.to_string())?;
             parse_fav_page(&resp.text().await.map_err(|e| e.to_string())?)?
         };
-        process_all_books(&books, &client, &args.outpath, &db_path, args.cover).await?;
+        process_all_books(&books, &client, &args.outpath, &db_path, args.thumbnail).await?;
     }
     println!("[+] Completed in {:.2?}", start.elapsed());
     Ok(())
