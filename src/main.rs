@@ -221,7 +221,8 @@ fn init_db(db_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS books (
-            id TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nhen_id TEXT UNIQUE,
             title_1 TEXT,
             title_2 TEXT,
             artists TEXT,
@@ -238,8 +239,11 @@ fn init_db(db_path: &Path) -> Result<(), String> {
 
 fn export_db_to_csv(db_path: &Path, out_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-    let mut stmt = conn.prepare("SELECT * FROM books ORDER BY id").map_err(|e| e.to_string())?;
-    
+    let mut stmt = conn.prepare("
+        SELECT nhen_id, title_1, title_2, artists, groups, tags, languages, pages
+        FROM books ORDER BY id DESC
+	").map_err(|e| e.to_string())?;
+
     let books = stmt.query_map([], |row| {
         Ok(BookData {
             id: row.get(0)?,
@@ -255,7 +259,7 @@ fn export_db_to_csv(db_path: &Path, out_path: &Path) -> Result<(), String> {
 
     let mut wtr = csv::Writer::from_path(out_path).map_err(|e| e.to_string())?;
     wtr.write_record(&[
-        "id",
+        "nhen_id",
         "title_1",
         "title_2",
         "artists",
@@ -285,14 +289,14 @@ fn export_db_to_csv(db_path: &Path, out_path: &Path) -> Result<(), String> {
 }
 
 fn book_exists_in_db(conn: &Connection, id: &str) -> Result<bool, String> {
-    let mut stmt = conn.prepare("SELECT id FROM books WHERE id = ?1").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT nhen_id FROM books WHERE nhen_id = ?1").map_err(|e| e.to_string())?;
     let exists = stmt.exists(params![id]).map_err(|e| e.to_string())?;
     Ok(exists)
 }
 
 fn save_book_to_db(conn: &Connection, book_data: &BookData, ext: &str) -> Result<(), String> {
     conn.execute(
-        "INSERT OR REPLACE INTO books (id, title_1, title_2, artists, groups, tags, languages, pages, image_ext)
+        "INSERT OR REPLACE INTO books (nhen_id, title_1, title_2, artists, groups, tags, languages, pages, image_ext)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             book_data.id,
