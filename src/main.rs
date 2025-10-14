@@ -9,9 +9,9 @@ use regex::Regex;
 use std::time::Instant;
 use argh::FromArgs;
 use std::ops::RangeInclusive;
-use std::path::Path;
 use rusqlite::{Connection, params};
 use tokio::{join, task};
+use std::path::{Path, PathBuf};
 
 const FAV_BASE_URL: &str = "https://nhentai.net/favorites/";
 const BASE_URL: &str = "https://nhentai.net";
@@ -134,7 +134,6 @@ fn parse_fav_page(html: &str) -> Result<Vec<HentaiBook>, String> {
 fn parse_book_page(html: &str, url: &str) -> Result<BookData, String> {
     let document = Html::parse_document(html);
 
-    // Parse selectors BEFORE any async work
     let h1_sel = Selector::parse("h1.title").map_err(|e| e.to_string())?;
     let h2_sel = Selector::parse("h2.title").map_err(|e| e.to_string())?;
     let tag_container_sel = Selector::parse("div.tag-container").map_err(|e| e.to_string())?;
@@ -218,7 +217,7 @@ fn extract_image_extension(url: &str) -> String {
 }
 
 // =================Database Stuff==========
-fn init_db(db_path: &str) -> Result<(), String> {
+fn init_db(db_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS books (
@@ -237,7 +236,7 @@ fn init_db(db_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn export_db_to_csv(db_path: &str, out_path: &str) -> Result<(), String> {
+fn export_db_to_csv(db_path: &Path, out_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("SELECT * FROM books ORDER BY id").map_err(|e| e.to_string())?;
     
@@ -281,7 +280,7 @@ fn export_db_to_csv(db_path: &str, out_path: &str) -> Result<(), String> {
     }
 
     wtr.flush().map_err(|e| e.to_string())?;
-    println!("[+] Exported database to {}", out_path);
+    println!("[+] Exported database to {}", out_path.display());
     Ok(())
 }
 
@@ -373,8 +372,8 @@ struct NhentaiFavsArgs {
 }
 
 //===============Async Mains================
-async fn download_image(client: &Client, url: &str, id: &str, out_path: &str, ext: &str) -> Result<(), String> {
-    let file_path = format!("{}/{}.{}", out_path, id, ext);
+async fn download_image(client: &Client, url: &str, id: &str, out_dir: &Path, ext: &str) -> Result<(), String> {
+    let file_path = out_dir.join("thumbnails").join(format!("{}.{}", id, ext));
 
     if Path::new(&file_path).exists() {
         return Ok(());
@@ -390,8 +389,8 @@ async fn download_image(client: &Client, url: &str, id: &str, out_path: &str, ex
 async fn process_all_books(
     books: &Vec<HentaiBook>,
     client: &wreq::Client,
-    outpath: &str,
-    db_path: &str,
+    outpath: &Path,
+    db_path: &Path,
     download_cover: bool,
 ) -> Result<(), String> {
     for chunk in books.chunks(2) {
@@ -399,10 +398,10 @@ async fn process_all_books(
 
         for book in chunk {
             let client = client.clone();
-            let outpath = outpath.to_string();
-            let db_path = db_path.to_string();
             let url = book.url.clone();
             let thumb_url = book.thumbnail_url.clone();
+            let outpath = PathBuf::from(outpath);
+            let db_path = PathBuf::from(db_path);
 
             let handle = task::spawn(async move {
                 if let Err(e) = process_single_book(&client, &url, &thumb_url, &outpath, &db_path, download_cover).await {
@@ -426,8 +425,8 @@ async fn process_single_book(
     client: &wreq::Client,
     url: &str,
     thumbnail_url: &str,
-    outpath: &str,
-    db_path: &str,
+    outpath: &Path,
+    db_path: &Path,
     download_cover: bool,
 ) -> Result<(), String> {
     let id = extract_id_from_url(url).unwrap_or_default();
@@ -472,17 +471,17 @@ async fn main() -> Result<(), String> {
     let args: NhentaiFavsArgs = argh::from_env();
 
     if args.cvt_csv {
-        let db_path = format!("{}/{}", args.outpath, SQ_DB_FILE);
+        let db_path = PathBuf::from(&args.outpath).join(SQ_DB_FILE);
         if Path::new(&db_path).exists() {
-            export_db_to_csv(&db_path, &format!("{}/nfavs_export.csv", args.outpath))?;
+            export_db_to_csv(&db_path, &PathBuf::from(&args.outpath).join("nfavs_export.csv"))?;
         } else {
-            println!("[-] Database not found at {}", db_path);
+            println!("[-] Database not found at {}", db_path.display());
         }
         return Ok(());
     }
 
-    std::fs::create_dir_all(&args.outpath).map_err(|e| e.to_string())?;
-    let db_path = format!("{}/{}", args.outpath, SQ_DB_FILE);
+    std::fs::create_dir_all(&PathBuf::from(&args.outpath).join("thumbnails")).map_err(|e| e.to_string())?;
+    let db_path = PathBuf::from(&args.outpath).join(SQ_DB_FILE);
     init_db(&db_path)?;
     let client = init_client()?;
     let start = Instant::now();
@@ -516,7 +515,7 @@ async fn main() -> Result<(), String> {
             let resp = client.get(&page_url).send().await.map_err(|e| e.to_string())?;
             parse_fav_page(&resp.text().await.map_err(|e| e.to_string())?)?
         };
-        process_all_books(&books, &client, &args.outpath, &db_path, args.thumbnail).await?;
+        process_all_books(&books, &client, &PathBuf::from(&args.outpath), &db_path, args.thumbnail).await?;
     }
     println!("[+] Completed in {:.2?}", start.elapsed());
     Ok(())
