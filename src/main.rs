@@ -12,6 +12,9 @@ use std::ops::RangeInclusive;
 use rusqlite::{Connection, params};
 use tokio::{join, task};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use indicatif::{ProgressBar, ProgressStyle};
 
 const FAV_BASE_URL: &str = "https://nhentai.net/favorites/";
 const BASE_URL: &str = "https://nhentai.net";
@@ -46,6 +49,37 @@ struct UserData {
     user_name: String,
     page_count: u32,
     fav_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct Stats {
+    total_skipped: Arc<AtomicU32>,
+    total_added: Arc<AtomicU32>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            total_skipped: Arc::new(AtomicU32::new(0)),
+            total_added: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn inc_skipped(&self) {
+        self.total_skipped.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn inc_added(&self) {
+        self.total_added.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn get_skipped(&self) -> u32 {
+        self.total_skipped.load(Ordering::SeqCst)
+    }
+
+    fn get_added(&self) -> u32 {
+        self.total_added.load(Ordering::SeqCst)
+    }
 }
 
 fn parse_login_data(html: &str) -> Result<UserData, String> {
@@ -237,6 +271,13 @@ fn init_db(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn get_total_books_in_db(db_path: &Path) -> Result<u32, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM books").map_err(|e| e.to_string())?;
+    let count: u32 = stmt.query_row([], |row| row.get(0)).map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
 fn export_db_to_csv(db_path: &Path, out_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("
@@ -396,7 +437,21 @@ async fn process_all_books(
     outpath: &Path,
     db_path: &Path,
     download_cover: bool,
+    page_num: u32,
+    total_pages: u32,
+    stats: Stats,
 ) -> Result<(), String> {
+    let total_books = books.len() as u32;
+    let book_counter = Arc::new(AtomicU32::new(0));
+
+    let pb = ProgressBar::new(total_books as u64);
+    pb.set_style(
+        ProgressStyle::with_template("[{wide_bar:.cyan/blue}] [{msg}] [{pos}/{len}]")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.set_message(format!("{}/{}", page_num, total_pages));
+
     for chunk in books.chunks(2) {
         let mut handles = Vec::new();
 
@@ -406,11 +461,13 @@ async fn process_all_books(
             let thumb_url = book.thumbnail_url.clone();
             let outpath = PathBuf::from(outpath);
             let db_path = PathBuf::from(db_path);
+            let counter = Arc::clone(&book_counter);
+            let stats = stats.clone();
 
             let handle = task::spawn(async move {
-                if let Err(e) = process_single_book(&client, &url, &thumb_url, &outpath, &db_path, download_cover).await {
-                    eprintln!("[-] Book task error ({}): {}", url, e);
-                }
+                let result = process_single_book(&client, &url, &thumb_url, &outpath, &db_path, download_cover, stats).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                result
             });
 
             handles.push(handle);
@@ -418,9 +475,11 @@ async fn process_all_books(
 
         for handle in handles {
             let _ = handle.await;
+            let current = book_counter.load(Ordering::SeqCst);
+            pb.set_position(current as u64);
         }
     }
-
+    pb.finish();
     Ok(())
 }
 
@@ -432,17 +491,16 @@ async fn process_single_book(
     outpath: &Path,
     db_path: &Path,
     download_cover: bool,
+    stats: Stats,
 ) -> Result<(), String> {
     let id = extract_id_from_url(url).unwrap_or_default();
 
     if let Ok(conn) = Connection::open(db_path) {
         if let Ok(true) = book_exists_in_db(&conn, &id) {
-            println!("[~] Already in DB: {}", id);
+            stats.inc_skipped();
             return Ok(());
         }
     }
-
-    println!("[+] Fetching {}", url);
 
     let html_fut = async {
         let html = client.get(url).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
@@ -465,6 +523,7 @@ async fn process_single_book(
 
     if let Ok(conn) = Connection::open(db_path) {
         save_book_to_db(&conn, &book_data, &ext)?;
+        stats.inc_added();
     }
 
     Ok(())
@@ -489,11 +548,16 @@ async fn main() -> Result<(), String> {
     init_db(&db_path)?;
     let client = init_client()?;
     let start = Instant::now();
+    let stats = Stats::new();
 
     let resp = client.get(FAV_BASE_URL).send().await.map_err(|e| e.to_string())?;
     if resp.status() != 200 {
-        return Err("[-] Unable to access nhentai, possibly CF?".to_string());
+        return Err(format!(
+            "[-] Failed to access nhentai.net: HTTP status code {}. Please check config.json for user agent and cookies.",
+            resp.status()
+        ));
     }
+
     let favpage = resp.text().await.map_err(|e| e.to_string())?;
     let login_data = parse_login_data(&favpage)?;
     println!("[+] Logged in as: {}", login_data.user_name);
@@ -509,18 +573,31 @@ async fn main() -> Result<(), String> {
         }
     }
     let page_range = args.page_range.clone().unwrap_or(1..=login_data.page_count);
+	println!("[+] Fetching data from page {} to {}", page_range.start(), page_range.end());
+	if args.thumbnail {
+		println!("[+] Thumbnail download toggle ON");
+	}
+    println!();
+
+    let total_pages = *page_range.end() - *page_range.start() + 1;
 
     for page_num in page_range {
         let page_url = format!("{}?page={}", FAV_BASE_URL, page_num);
-        println!("\n[*] Fetching page {}", page_num);
         let books = if page_num == 1 {
             parse_fav_page(&favpage)?
         } else {
             let resp = client.get(&page_url).send().await.map_err(|e| e.to_string())?;
             parse_fav_page(&resp.text().await.map_err(|e| e.to_string())?)?
         };
-        process_all_books(&books, &client, &PathBuf::from(&args.outpath), &db_path, args.thumbnail).await?;
+        process_all_books(&books, &client, &PathBuf::from(&args.outpath), &db_path, args.thumbnail, page_num, total_pages, stats.clone()).await?;
     }
+
+    let total_in_db = get_total_books_in_db(&db_path)?;
+
+    println!(); println!();
     println!("[+] Completed in {:.2?}", start.elapsed());
+    println!("[+] Total skipped (already exists): {}", stats.get_skipped());
+    println!("[+] Total new added: {}", stats.get_added());
+    println!("[+] Total in database: {}", total_in_db);
     Ok(())
 }
