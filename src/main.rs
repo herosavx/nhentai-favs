@@ -355,15 +355,21 @@ fn save_book_to_db(conn: &Connection, book_data: &BookData, ext: &str) -> Result
 }
 
 // =================Config/Init/Args Stuff=================
-fn read_config(file_path: &str) -> Result<Config, String> {
-    let file = File::open(file_path).map_err(|e| e.to_string())?;
+fn read_config(file_path: &Path) -> Result<Config, String> {
+    let file = File::open(file_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("[-] Config file not found at: {}", file_path.display())
+        } else {
+            format!("[-] Failed to open config file: {}", e)
+        }
+	})?;
     let reader = BufReader::new(file);
     let config = serde_json::from_reader(reader).map_err(|e| e.to_string())?;
     Ok(config)
 }
 
-fn init_client() -> Result<Client, String> {
-    let config = read_config("config.json")?;
+fn init_client(outdir: &Path) -> Result<Client, String> {
+    let config = read_config(&outdir.join("config.json"))?;
     let mut headers = HeaderMap::new();
 
     headers.insert(USER_AGENT, HeaderValue::from_str(&config.user_agent).map_err(|e| e.to_string())?);
@@ -532,21 +538,22 @@ async fn process_single_book(
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args: NhentaiFavsArgs = argh::from_env();
+    let outpath = PathBuf::from(&args.outpath);
 
     if args.cvt_csv {
-        let db_path = PathBuf::from(&args.outpath).join(SQ_DB_FILE);
+        let db_path = outpath.join(SQ_DB_FILE);
         if Path::new(&db_path).exists() {
-            export_db_to_csv(&db_path, &PathBuf::from(&args.outpath).join("nfavs_export.csv"))?;
+            export_db_to_csv(&db_path, &outpath.join("nfavs_export.csv"))?;
         } else {
             println!("[-] Database not found at {}", db_path.display());
         }
         return Ok(());
     }
 
-    std::fs::create_dir_all(&PathBuf::from(&args.outpath).join("thumbnails")).map_err(|e| e.to_string())?;
-    let db_path = PathBuf::from(&args.outpath).join(SQ_DB_FILE);
+    std::fs::create_dir_all(&outpath.join("thumbnails")).map_err(|e| e.to_string())?;
+    let db_path = outpath.join(SQ_DB_FILE);
     init_db(&db_path)?;
-    let client = init_client()?;
+    let client = init_client(&outpath)?;
     let start = Instant::now();
     let stats = Stats::new();
 
@@ -589,7 +596,7 @@ async fn main() -> Result<(), String> {
             let resp = client.get(&page_url).send().await.map_err(|e| e.to_string())?;
             parse_fav_page(&resp.text().await.map_err(|e| e.to_string())?)?
         };
-        process_all_books(&books, &client, &PathBuf::from(&args.outpath), &db_path, args.thumbnail, page_num, total_pages, stats.clone()).await?;
+        process_all_books(&books, &client, &outpath, &db_path, args.thumbnail, page_num, total_pages, stats.clone()).await?;
     }
 
     let total_in_db = get_total_books_in_db(&db_path)?;
