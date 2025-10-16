@@ -2,7 +2,7 @@ use wreq::Client;
 use wreq::header::{HeaderMap, HeaderValue, USER_AGENT, COOKIE};
 use wreq_util::Emulation;
 use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer};
 use std::fs::File;
 use std::io::BufReader;
 use regex::Regex;
@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
 
-const FAV_BASE_URL: &str = "https://nhentai.net/favorites/";
-const BASE_URL: &str = "https://nhentai.net";
+const FAV_URL: &str = "https://nhentai.net/favorites/";
+const GALLERY_URL: &str = "https://nhentai.net/api/gallery/";
 const SQ_DB_FILE: &str = "nfavs.db";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct Config {
     user_agent: String,
     cookies: Vec<String>,
@@ -43,6 +43,37 @@ struct BookData {
     id: String,
     pages: u32,
 }
+
+// == nhentai gallery api json structures ==
+#[derive(Debug, Deserialize)]
+struct NhentaiTitle {
+    english: Option<String>,
+    japanese: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NhentaiTag {
+    #[serde(rename = "type")]
+    tag_type: String,
+    name: String,
+    count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NhentaiResponse {
+    Gallery {
+        #[serde(deserialize_with = "deserialize_string_or_number")]
+        id: u32,
+        title: NhentaiTitle,
+        tags: Vec<NhentaiTag>,
+        num_pages: u32,
+    },
+    Error {
+        error: String,
+    },
+}
+//==============================
 
 #[derive(Debug)]
 struct UserData {
@@ -82,6 +113,26 @@ impl Stats {
     }
 }
 
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u32),
+    }
+
+    match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s.parse().map_err(|_| {
+            serde::de::Error::custom(format!("Failed to parse '{}' as u32", s))
+        }),
+        StringOrNumber::Number(n) => Ok(n),
+    }
+}
+
+//=========== Response parsers ========
 fn parse_login_data(html: &str) -> Result<UserData, String> {
     let document = Html::parse_document(html);
 
@@ -150,7 +201,8 @@ fn parse_fav_page(html: &str) -> Result<Vec<HentaiBook>, String> {
             .select(&link_selector)
             .next()
             .and_then(|a| a.value().attr("href"))
-            .map(|href| format!("{}{}", BASE_URL, href))
+            .and_then(|href| extract_id_from_url(href))
+            .map(|id| format!("{}{}", GALLERY_URL, id))
             .unwrap_or_default();
 
         if !url.is_empty() && !thumbnail_url.is_empty() {
@@ -165,78 +217,56 @@ fn parse_fav_page(html: &str) -> Result<Vec<HentaiBook>, String> {
     Ok(books)
 }
 
-fn parse_book_page(html: &str, url: &str) -> Result<BookData, String> {
-    let document = Html::parse_document(html);
+fn parse_book_json(json_str: &str) -> Result<BookData, String> {
+    let parsed: NhentaiResponse =
+        serde_json::from_str(json_str).map_err(|e| format!("Invalid JSON: {e}"))?;
 
-    let h1_sel = Selector::parse("h1.title").map_err(|e| e.to_string())?;
-    let h2_sel = Selector::parse("h2.title").map_err(|e| e.to_string())?;
-    let tag_container_sel = Selector::parse("div.tag-container").map_err(|e| e.to_string())?;
-    let name_sel = Selector::parse("span.name").map_err(|e| e.to_string())?;
+    match parsed {
+        NhentaiResponse::Error { error } => Err(format!("Gallery error: {error}")),
 
-    let title_1 = document
-        .select(&h1_sel)
-        .next()
-        .map(|el| el.text().collect::<String>().trim().to_string())
-        .unwrap_or_default();
+        NhentaiResponse::Gallery {
+            id,
+            title,
+            tags,
+            num_pages,
+        } => {
+            let mut artists = Vec::new();
+            let mut groups = Vec::new();
+            let mut tags_vec = Vec::new();
+            let mut languages = Vec::new();
 
-    let title_2 = document
-        .select(&h2_sel)
-        .next()
-        .map(|el| el.text().collect::<String>().trim().to_string())
-        .unwrap_or_default();
+            for tag in tags {
+                match tag.tag_type.as_str() {
+                    "artist" => artists.push(tag),
+                    "group" => groups.push(tag),
+                    "tag" => tags_vec.push(tag),
+                    "language" => languages.push(tag),
+                    _ => {}
+                }
+            }
 
-    let mut artists = String::new();
-    let mut groups = String::new();
-    let mut tags = String::new();
-    let mut languages = String::new();
-    let mut pages: u32 = 0;
+            // Sort only by popularity (count descending)
+            let sort_tags = |mut v: Vec<NhentaiTag>| -> Vec<String> {
+                v.sort_by(|a, b| b.count.cmp(&a.count));
+                v.into_iter().map(|t| t.name).collect()
+            };
 
-    for div in document.select(&tag_container_sel) {
-        let class = div.value().attr("class").unwrap_or("");
-        if class.contains("hidden") {
-            continue;
-        }
-
-        let label = div.text().take(1).collect::<String>();
-        let lower = label.to_lowercase();
-
-        let names: Vec<String> = div
-            .select(&name_sel)
-            .map(|n| n.text().collect::<String>().trim().to_string())
-            .collect();
-
-        if lower.contains("artists:") {
-            artists = names.join(", ");
-        } else if lower.contains("groups:") {
-            groups = names.join(", ");
-        } else if lower.contains("tags:") {
-            tags = names.join(", ");
-        } else if lower.contains("languages:") {
-            languages = names.join(", ");
-        } else if lower.contains("pages:") {
-            pages = names
-                .get(0)
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
+            Ok(BookData {
+                title_1: title.english.unwrap_or_default(),
+                title_2: title.japanese.unwrap_or_default(),
+                artists: sort_tags(artists).join(", "),
+                groups: sort_tags(groups).join(", "),
+                tags: sort_tags(tags_vec).join(", "),
+                languages: sort_tags(languages).join(", "),
+                id: id.to_string(),
+                pages: num_pages,
+            })
         }
     }
-
-    let id = extract_id_from_url(url).unwrap_or_default();
-
-    Ok(BookData {
-        title_1,
-        title_2,
-        artists,
-        groups,
-        tags,
-        languages,
-        id,
-        pages,
-    })
 }
 
 fn extract_id_from_url(url: &str) -> Option<String> {
-    let re = Regex::new(r"/g/(\d+)/?").unwrap();
+    let re = Regex::new(r"(?:/g/|/gallery/)(\d+)/?").unwrap();
     re.captures(url)
         .and_then(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
@@ -499,7 +529,12 @@ async fn process_all_books(
         for handle in handles {
             match handle.await {
                 Ok(Ok((book_data, ext))) => to_insert.push((book_data, ext)),
-                _ => {},
+                Ok(Err(e)) => {
+                    eprintln!("[-] Book task failed: {}", e);
+                }
+                Err(e) => {
+                    eprintln!("[-] Join error: {}", e);
+                }
             }
         }
 
@@ -539,8 +574,8 @@ async fn process_single_book(
 
     let (html_res, _image_res) = join!(html_fut, image_fut);
 
-    let html_buf = html_res?;
-    let book_data = parse_book_page(&html_buf, url)?;
+    let json_buf = html_res?;
+    let book_data = parse_book_json(&json_buf)?;
     Ok((book_data, ext))
 }
 
@@ -566,7 +601,7 @@ async fn main() -> Result<(), String> {
     let start = Instant::now();
     let stats = Stats::new();
 
-    let resp = client.get(FAV_BASE_URL).send().await.map_err(|e| e.to_string())?;
+    let resp = client.get(FAV_URL).send().await.map_err(|e| e.to_string())?;
     if resp.status() != 200 {
         return Err(format!(
             "[-] Failed to access nhentai.net: HTTP status code {}. Please check config.json for user agent and cookies.",
@@ -598,7 +633,7 @@ async fn main() -> Result<(), String> {
     let page_start = *page_range.start();
 
     for page_num in page_range.rev() {
-        let page_url = format!("{}?page={}", FAV_BASE_URL, page_num);
+        let page_url = format!("{}?page={}", FAV_URL, page_num);
         let books = if page_num == 1 {
             parse_fav_page(&favpage)?
         } else {
