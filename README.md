@@ -25,17 +25,14 @@ Fetch all favorite list (not recommended if you have alot books):
 ```
 ./nhentai-favs --outpath /path/to/output/folder
 ```
-Fetch certain page range:
+Fetch certain page range (Fetch order 10->9->....1):
+You can use `--page-range 10-1`, But fetch order remain same, so doesn't matter.
 ```
 ./nhentai-favs --page-range 1-10 --outpath /path/to/output/folder
 ```
 For only one certain page (e.g. page 2):
 ```
 ./nhentai-favs --page-range 2-2 --outpath /path/to/output/folder
-```
-Download thumbnail image alongside:
-```
-./nhentai-favs --thumbnail --page-range 1-10 --outpath /path/to/output/folder
 ```
 Convert a existing database to CSV file:
 ```
@@ -48,11 +45,23 @@ Convert a existing database to CSV file:
 
 **VERY IMPORTANT** : If your favourite list is big, then consider using `--page-range` option with 10 to 15 pages at a time, 
 then try other 10-15 pages some other time until you cover all your fav pages.
-But remember, don't add new favourite books (in the website) until you're finished backing up all pages (i mean you definitely can, if you know what you're doing). Once all pages are done, 
-then moving onwards whenever you need to update the database just run the typical command without range option:
+
+**if you want to maintain the same order as nhentai website then consider starting from last page**, e.g:
+
+-> You got 30 page content
+
+-> You can do: `--page-range 30-20`, later `--page-range 19-10`, some other time `--page-range 9-1`. But make sure NO single page left out in the process. Otherwise left out page won't be in order whenever gets added later.
+
+-> This also possible: `--page-range 30-20`, `--page-range 20-10`, `--page-range 10-1`. Duplicate pages will get ignored.
+
+-> Don't understand anything? just use this command, the order will be maintained on your behalf (Again, **not recommended** if you got huge number of pages):
 ```
 ./nhentai-favs --outpath /path/to/output/folder
 ```
+Initially once all pages are done, then moving onwards whenever you need to update the database just run the typical above command without range option.
+As most of the book information does exists in local database it won't cause much network operation and will be very fast.
+But ofcourse you can also use page range of newly added content.
+
 Anyways, make sure you never delete database (`nfavs.db`) file, you can delete the csv file exported from database, because you can always export that if database file exists.
 And db file is very essential for tracking of your data.
 

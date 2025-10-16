@@ -386,18 +386,25 @@ fn init_client(outdir: &Path) -> Result<Client, String> {
     Ok(client)
 }
 
+// We take input as 70-1 or 1-70, but internally we store them as 1-70 and just use desc order when iterating
 fn parse_page_range(value: &str) -> Result<RangeInclusive<u32>, String> {
     let parts: Vec<&str> = value.split('-').collect();
-    let start: u32 = parts.get(0)
+    let first: u32 = parts.get(0)
         .and_then(|s| s.trim().parse().ok())
         .ok_or("Range format error")?;
-    let end: u32 = parts.get(1)
+    let second: u32 = parts.get(1)
         .and_then(|s| s.trim().parse().ok())
         .ok_or("Range format error")?;
 
-    if start < 1 || start > end {
+    if first < 1 || second < 1 {
         return Err("Range format error".to_string());
     }
+
+    let (start, end) = if first >= second {
+        (second, first)
+    } else {
+        (first, second)
+    };
 
     Ok(start..=end)
 }
@@ -409,7 +416,7 @@ struct NhentaiFavsArgs {
     #[argh(switch, short = 't')]
     thumbnail: bool,
 
-    /// page range to fetch data from (e.g., 1-20, 1-1)
+    /// page range to fetch data from (e.g. 1-20, 20-1). data's are fetch from higher to lower page.
     #[argh(option, short = 'p', from_str_fn(parse_page_range))]
     page_range: Option<RangeInclusive<u32>>,
 
@@ -444,11 +451,12 @@ async fn process_all_books(
     db_path: &Path,
     download_cover: bool,
     page_num: u32,
-    total_pages: u32,
+    dest_page: u32,
     stats: Stats,
 ) -> Result<(), String> {
     let total_books = books.len() as u32;
     let book_counter = Arc::new(AtomicU32::new(0));
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     let pb = ProgressBar::new(total_books as u64);
     pb.set_style(
@@ -456,22 +464,31 @@ async fn process_all_books(
             .unwrap()
             .progress_chars("=>-"),
     );
-    pb.set_message(format!("{}/{}", page_num, total_pages));
+    pb.set_message(format!("{}->{}", page_num, dest_page));
 
-    for chunk in books.chunks(2) {
+    for chunk in books.iter().rev().collect::<Vec<_>>().chunks(2) {
         let mut handles = Vec::new();
+        let mut to_insert = Vec::new();
 
         for book in chunk {
+            let id = extract_id_from_url(&book.url).unwrap_or_default();
+
+            // Early skip if exists
+            if let Ok(true) = book_exists_in_db(&conn, &id) {
+                stats.inc_skipped();
+                let current = book_counter.fetch_add(1, Ordering::SeqCst);
+                pb.set_position(current as u64);
+                continue;
+            }
+
             let client = client.clone();
             let url = book.url.clone();
             let thumb_url = book.thumbnail_url.clone();
             let outpath = PathBuf::from(outpath);
-            let db_path = PathBuf::from(db_path);
             let counter = Arc::clone(&book_counter);
-            let stats = stats.clone();
 
             let handle = task::spawn(async move {
-                let result = process_single_book(&client, &url, &thumb_url, &outpath, &db_path, download_cover, stats).await;
+                let result = process_single_book(&client, &url, &thumb_url, &outpath, download_cover).await;
                 counter.fetch_add(1, Ordering::SeqCst);
                 result
             });
@@ -480,10 +497,17 @@ async fn process_all_books(
         }
 
         for handle in handles {
-            let _ = handle.await;
-            let current = book_counter.load(Ordering::SeqCst);
-            pb.set_position(current as u64);
+            match handle.await {
+                Ok(Ok((book_data, ext))) => to_insert.push((book_data, ext)),
+                _ => {},
+            }
         }
+
+        for (book_data, ext) in to_insert.into_iter() {
+            save_book_to_db(&conn, &book_data, &ext)?;
+            stats.inc_added();
+        }
+        pb.set_position(book_counter.load(Ordering::SeqCst) as u64);
     }
     pb.finish();
     Ok(())
@@ -495,18 +519,9 @@ async fn process_single_book(
     url: &str,
     thumbnail_url: &str,
     outpath: &Path,
-    db_path: &Path,
     download_cover: bool,
-    stats: Stats,
-) -> Result<(), String> {
+) -> Result<(BookData, String), String> {
     let id = extract_id_from_url(url).unwrap_or_default();
-
-    if let Ok(conn) = Connection::open(db_path) {
-        if let Ok(true) = book_exists_in_db(&conn, &id) {
-            stats.inc_skipped();
-            return Ok(());
-        }
-    }
 
     let html_fut = async {
         let html = client.get(url).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
@@ -526,13 +541,7 @@ async fn process_single_book(
 
     let html_buf = html_res?;
     let book_data = parse_book_page(&html_buf, url)?;
-
-    if let Ok(conn) = Connection::open(db_path) {
-        save_book_to_db(&conn, &book_data, &ext)?;
-        stats.inc_added();
-    }
-
-    Ok(())
+    Ok((book_data, ext))
 }
 
 #[tokio::main]
@@ -580,15 +589,15 @@ async fn main() -> Result<(), String> {
         }
     }
     let page_range = args.page_range.clone().unwrap_or(1..=login_data.page_count);
-	println!("[+] Fetching data from page {} to {}", page_range.start(), page_range.end());
+	println!("[+] Fetching data from page {} to {}", page_range.end(), page_range.start());
 	if args.thumbnail {
 		println!("[+] Thumbnail download toggle ON");
 	}
     println!();
 
-    let total_pages = *page_range.end() - *page_range.start() + 1;
+    let page_start = *page_range.start();
 
-    for page_num in page_range {
+    for page_num in page_range.rev() {
         let page_url = format!("{}?page={}", FAV_BASE_URL, page_num);
         let books = if page_num == 1 {
             parse_fav_page(&favpage)?
@@ -596,7 +605,7 @@ async fn main() -> Result<(), String> {
             let resp = client.get(&page_url).send().await.map_err(|e| e.to_string())?;
             parse_fav_page(&resp.text().await.map_err(|e| e.to_string())?)?
         };
-        process_all_books(&books, &client, &outpath, &db_path, args.thumbnail, page_num, total_pages, stats.clone()).await?;
+        process_all_books(&books, &client, &outpath, &db_path, args.thumbnail, page_num, page_start, stats.clone()).await?;
     }
 
     let total_in_db = get_total_books_in_db(&db_path)?;
