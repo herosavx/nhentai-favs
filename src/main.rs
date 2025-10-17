@@ -502,7 +502,7 @@ struct NhentaiFavsArgs {
 
 //===============Async Mains================
 async fn download_image(client: &Client, url: &str, id: &str, out_dir: &Path, ext: &str) -> Result<(), String> {
-    let file_path = out_dir.join("thumbnails").join(format!("{}.{}", id, ext));
+    let file_path = out_dir.join(".thumbnails").join(format!("{}.{}", id, ext));
 
     if Path::new(&file_path).exists() {
         return Ok(());
@@ -652,7 +652,7 @@ async fn main() -> Result<(), String> {
         println!("[+] Database backed up to {}", prev_db_path.display());
     }
 
-    std::fs::create_dir_all(&outpath.join("thumbnails")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&outpath.join(".thumbnails")).map_err(|e| e.to_string())?;
     let db_path = outpath.join(SQ_DB_FILE);
     init_db(&db_path)?;
     let client = init_client(&outpath)?;
