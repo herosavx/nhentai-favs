@@ -4,7 +4,7 @@ use wreq_util::Emulation;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Deserializer};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use regex::Regex;
 use std::time::Instant;
 use argh::FromArgs;
@@ -439,6 +439,43 @@ fn parse_page_range(value: &str) -> Result<RangeInclusive<u32>, String> {
     Ok(start..=end)
 }
 
+fn restore_database(outpath: &Path) -> Result<(), String> {
+    let db_path = outpath.join(SQ_DB_FILE);
+    let prevstate_dir = outpath.join(".prevstate");
+    let prev_db_path = prevstate_dir.join(SQ_DB_FILE);
+
+    if !prev_db_path.exists() {
+        println!("[-] No previous database found at {}", prev_db_path.display());
+        return Ok(());
+    }
+
+    let prev_count = get_total_books_in_db(&prev_db_path)?;
+    println!("[*] Previous database contains {} books", prev_count);
+
+    if db_path.exists() {
+        let current_count = get_total_books_in_db(&db_path)?;
+        println!("[*] Current database contains {} books", current_count);
+        println!("[!] WARNING: Restoring will replace the current database");
+    } else {
+        println!("[*] No current database exists");
+    }
+
+    print!("\n[?] Do you want to restore from the previous database? (y/N): ");
+    std::io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+
+    if input.trim().to_lowercase() != "y" {
+        println!("[*] Restore cancelled");
+        return Ok(());
+    }
+
+    std::fs::copy(&prev_db_path, &db_path).map_err(|e| format!("Failed to restore database: {}", e))?;
+    println!("[+] Database restored successfully from {}", prev_db_path.display());
+    Ok(())
+}
+
 #[derive(FromArgs)]
 /// Command-line tool for exporting nhentai favorite list
 struct NhentaiFavsArgs {
@@ -453,6 +490,10 @@ struct NhentaiFavsArgs {
     /// convert existing database to csv format in outpath. no network operation performed.
     #[argh(switch, short = 'c')]
     cvt_csv: bool,
+
+    /// restore previous state of database if currupted by previous run (dangerous).
+    #[argh(switch)]
+    restore: bool,
 
     /// output directory, may contain existing database
     #[argh(option, short = 'o')]
@@ -583,15 +624,32 @@ async fn process_single_book(
 async fn main() -> Result<(), String> {
     let args: NhentaiFavsArgs = argh::from_env();
     let outpath = PathBuf::from(&args.outpath);
+    let db_path = outpath.join(SQ_DB_FILE);
 
     if args.cvt_csv {
-        let db_path = outpath.join(SQ_DB_FILE);
-        if Path::new(&db_path).exists() {
+        if db_path.exists() {
             export_db_to_csv(&db_path, &outpath.join("nfavs_export.csv"))?;
         } else {
             println!("[-] Database not found at {}", db_path.display());
         }
         return Ok(());
+    }
+
+    if args.restore {
+        return restore_database(&outpath);
+    }
+
+    // Backup current database to .prevstate directory
+    if db_path.exists() {
+        let prevstate_dir = outpath.join(".prevstate");
+
+        if !prevstate_dir.exists() {
+            std::fs::create_dir_all(&prevstate_dir).map_err(|e| format!("Failed to create .prevstate directory: {}", e))?;
+        }
+
+        let prev_db_path = prevstate_dir.join(SQ_DB_FILE);
+        std::fs::copy(&db_path, &prev_db_path).map_err(|e| format!("Failed to backup database: {}", e))?;
+        println!("[+] Database backed up to {}", prev_db_path.display());
     }
 
     std::fs::create_dir_all(&outpath.join("thumbnails")).map_err(|e| e.to_string())?;
