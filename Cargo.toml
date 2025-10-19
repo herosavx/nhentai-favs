@@ -15,6 +15,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 argh = "0.1.13"
 csv = "^1.0.0"
 indicatif = "0.18.0"
+thiserror = "2.0.17"
 
 [profile.release]
 strip = true
