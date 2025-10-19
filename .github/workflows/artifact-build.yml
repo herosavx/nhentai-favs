@@ -1,0 +1,72 @@
+name: Build Artifacts
+
+on: [workflow_dispatch]
+
+env:
+  RUST_VERSION: 1.90.0
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            bin: target/x86_64-unknown-linux-gnu/release/nhentai-favs
+          - target: x86_64-pc-windows-gnu
+            bin: target/x86_64-pc-windows-gnu/release/nhentai-favs.exe
+          - target: aarch64-linux-android
+            bin: target/aarch64-linux-android/release/nhentai-favs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        uses: actions/cache@v4
+        with:
+          path: android-ndk-r27b
+          key: android-ndk-r27b-${{ runner.os }}
+          restore-keys: android-ndk-r27b-${{ runner.os }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Platform Toolchains
+        run: |
+          sudo apt-get update -qq
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-gnu)
+              sudo apt-get install -y mingw-w64 nasm cmake ;;
+            aarch64-linux-android)
+              sudo apt-get install -y wget unzip
+              wget -q https://dl.google.com/android/repository/android-ndk-r27b-linux.zip
+              unzip -q android-ndk-r27b-linux.zip
+              echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27b" >> $GITHUB_ENV
+              echo "$PWD/android-ndk-r27b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH ;;
+            *)
+              sudo apt-get install -y build-essential ;;
+          esac
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-linux-android" ]; then
+            export CC_aarch64_linux_android=aarch64-linux-android35-clang
+            export CXX_aarch64_linux_android=aarch64-linux-android35-clang++
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android35-clang
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.bin }}
+          retention-days: 30
