@@ -2,10 +2,9 @@
 A local backup tool for nhentai favorites list.
 This project is tailored to my personal needs and may not be suitable for you.
 
-## What & Why
-I needed to export my g^^ning material info in case nhentai purges some of it or the site goes down someday.
-I'm not a programmer, so I used AI and some documentation to create this for my personal use only.
-**I don't recommend using it**, but if you do, read the "How to Use" section.
+**AGAIN, FOR MY PERSONAL USE. I DON'T RECOMMEND YOU TO USE THIS**
+
+Mostly written by AI
 
 ## How to Use
 Before explaining how to use this, let me give a quick overview:
