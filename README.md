@@ -64,6 +64,14 @@ But ofcourse you can also use page range of newly added content.
 Anyways, make sure you never delete database (`nfavs.db`) file, you can delete the csv file exported from database, because you can always export that if database file exists.
 And db file is very essential for tracking of your data.
 
+### A Backup point
+While the page scraping process is ongoing, you may encounter network-related errors for a few books. For example, out of 25 books, 2 might encounter errors.
+In such cases, you can rerun the program with those missing book's page-range option to include those excluded books. However, this may cause the order to become mismatched.
+To prevent this, the program always backs up the database in a specific folder. You can use the following command to restore the previous database state:
+```
+./nhentai-favs --restore /path/to/output/folder
+```
+
 ### How to get cookies
 Grab your browser's user agent from this [website](https://www.whatismybrowser.com/detect/what-is-my-user-agent/).
 
