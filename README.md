@@ -69,7 +69,7 @@ While the page scraping process is ongoing, you may encounter network-related er
 In such cases, you can rerun the program with those missing book's page-range option to include those excluded books. However, this may cause the order to become mismatched.
 To prevent this, the program always backs up the database in a specific folder. You can use the following command to restore the previous database state:
 ```
-./nhentai-favs --restore /path/to/output/folder
+./nhentai-favs --restore -o /path/to/output/folder
 ```
 
 ### How to get cookies
