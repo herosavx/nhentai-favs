@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 #[derive(FromArgs, Debug)]
 /// Command-line tool for exporting nhentai favorite list
 pub struct Args {
-    /// whether to download thumbnail images (default: false)
+    /// whether to download cover images (default: false)
     #[argh(switch, short = 't')]
     pub thumbnail: bool,
 
@@ -21,7 +21,7 @@ pub struct Args {
     #[argh(switch)]
     pub restore: bool,
 
-    /// output directory, may contain existing database
+    /// output directory, may contain existing database and config.json
     #[argh(option, short = 'o')]
     pub outpath: String,
 }
