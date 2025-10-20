@@ -72,6 +72,9 @@ To prevent this, the program always backs up the database in a specific folder. 
 ./nhentai-favs --restore -o /path/to/output/folder
 ```
 
+### Download
+Get the binary from one of the actions [artifacts](https://github.com/herosavx/nhentai-favs/actions).
+
 ### How to get cookies
 Grab your browser's user agent from this [website](https://www.whatismybrowser.com/detect/what-is-my-user-agent/).
 
