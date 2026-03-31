@@ -1,124 +1,202 @@
-mod cli;
-mod config;
-mod database;
-mod error;
+mod api;
+mod db;
 mod models;
-mod nhen_client;
-mod parser;
-mod scraper;
-mod stats;
 
-use std::path::PathBuf;
-use std::time::Instant;
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::{fs, path::{Path, PathBuf}};
+use argh::FromArgs;
 
-use crate::{
-    cli::Args, database::*, error::Result, nhen_client::NHentaiClient, scraper::FavoritesScraper,
-    stats::Stats,
-};
+use api::NhenClient;
+use db::{Database, TagsDatabase};
+use models::Config;
+
+#[derive(FromArgs, Debug)]
+/// Local backup tool for nhentai favorites via v2 API.
+struct Args {
+    /// output directory for the database and config
+    #[argh(option, short = 'o')]
+    outpath: PathBuf,
+
+    /// [Action] generate the tag bank from scratch safely
+    #[argh(switch, short = 'g')]
+    generate_tagbank: bool,
+
+    /// [Action] convert existing database to csv format
+    #[argh(switch, short = 'c')]
+    cvt_csv: bool,
+
+    /// [Action] restore nfavs.db from the previous state
+    #[argh(switch, short = 'r')]
+    restore: bool,
+
+    /// [Action] download thumbnails for existing items in the database
+    #[argh(switch, short = 't')]
+    thumbnail: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Args = argh::from_env();
-    let outpath = PathBuf::from(&args.outpath);
-    let db_path = outpath.join(DB_FILENAME);
-    let prevstate_dir = outpath.join(".prevstate");
+    fs::create_dir_all(&args.outpath)?;
+    fs::create_dir_all(&args.outpath.join(".prevstate"))?;
 
-    if args.export_csv {
-        return handle_csv_export(&db_path, &outpath);
+    let db = Database::new(&args.outpath)?;
+
+    if args.cvt_csv {
+        return db.export_to_csv();
     }
 
     if args.restore {
-        return restore_database(&db_path, &prevstate_dir);
+        return db.restore_nfavs();
     }
 
-    run_scraper(args, outpath, db_path, prevstate_dir).await
-}
-
-fn handle_csv_export(db_path: &PathBuf, outpath: &PathBuf) -> Result<()> {
-    if db_path.exists() {
-        let db = Database::new(db_path)?;
-        db.export_to_csv(&outpath.join("nfavs_export.csv"))?;
-    } else {
-        println!("[-] Database not found at {}", db_path.display());
-    }
-    Ok(())
-}
-
-async fn run_scraper(
-    args: Args,
-    outpath: PathBuf,
-    db_path: PathBuf,
-    prevstate_dir: PathBuf,
-) -> Result<()> {
-    // Backup existing database
-    backup_database(&db_path, &prevstate_dir)?;
-
-    std::fs::create_dir_all(&outpath.join(".thumbnails"))?;
-
-    let database = Database::new(&db_path)?;
-    database.initialize()?;
-
-    let client = NHentaiClient::new(&outpath.join("config.json"))?;
-    let scraper = FavoritesScraper::new(client, database, outpath.clone());
-
-    let start = Instant::now();
-    let stats = Stats::new();
-
-    // Fetch user data and validate
-    let (user_data, first_page_html) = scraper.fetch_user_data().await?;
-
-    print_user_info(&user_data);
-
-    if user_data.is_empty() {
-        println!("[-] No favorite pages available");
-        return Ok(());
+    if args.thumbnail {
+        return download_thumbnails(&db, &args.outpath).await;
     }
 
-    args.validate_page_range(user_data.page_count)?;
-    let page_range = args.get_page_range(user_data.page_count);
-
-    print_scraping_info(&page_range, args.thumbnail);
-
-    // Scrape pages
-    let page_start = *page_range.start();
-    for page_num in page_range.rev() {
-        let cached_page = if page_num == 1 {
-            Some(first_page_html.as_str())
-        } else {
-            None
-        };
-
-        let books = scraper.scrape_page(page_num, cached_page).await?;
-
-        scraper
-            .process_all_books(&books, args.thumbnail, page_num, page_start, stats.clone())
-            .await?;
+    if args.generate_tagbank {
+        return generate_tags(&args.outpath).await;
     }
 
-    // Print summary
-    let db = Database::new(&db_path)?;
-    let total_in_db = db.count_books()?;
+    // For Syncing, we need the config file for the API key
+    let config_path = args.outpath.join("config.json");
+    let config_str = fs::read_to_string(&config_path)
+        .context("Could not read config.json. Ensure it contains your 'api_key'.")?;
+    let config: Config = serde_json::from_str(&config_str)?;
 
-    println!("[+] Completed in {:.2?}", start.elapsed());
-    stats.print_summary(total_in_db);
+    // Sync action
+    let client = NhenClient::new(&config.api_key)?;
+    db.backup_nfavs()?;
+    sync_favorites(&client, &db).await?;
 
     Ok(())
 }
 
-fn print_user_info(user_data: &crate::models::UserData) {
-    println!("[+] Logged in as: {}", user_data.user_name);
-    println!("[+] Total favorites: {}", user_data.fav_count);
-    println!("[+] Total pages: {}", user_data.page_count);
+async fn generate_tags(outpath: &Path) -> Result<()> {
+    let target_types = ["artist", "group", "language", "tag"];
+    let tmp_tags_path = outpath.join("tags.db.tmp");
+    let real_tags_path = outpath.join("tags.db");
+    let prev_tags_path = outpath.join(".prevstate").join("tags.db");
+
+    // Start fresh for tmp
+    if tmp_tags_path.exists() {
+        fs::remove_file(&tmp_tags_path)?;
+    }
+
+    let tmp_db = TagsDatabase::new(&tmp_tags_path)?;
+    let clean_client = NhenClient::clean_client()?;
+
+    for t_type in target_types {
+        println!("\n[*] Fetching tag type: {}", t_type);
+        
+        let initial_resp = NhenClient::get_tags_page(&clean_client, t_type, 1).await?;
+        let pb = ProgressBar::new(initial_resp.num_pages as u64);
+
+        for page in 1..=initial_resp.num_pages {
+            let resp = NhenClient::get_tags_page(&clean_client, t_type, page).await?;
+            for tag in resp.result {
+                tmp_db.insert_tag(&tag)?;
+            }
+            pb.inc(1);
+        }
+        pb.finish_with_message("Done");
+    }
+
+    // Successfully grabbed everything. Now safely swap.
+    if real_tags_path.exists() {
+        fs::rename(&real_tags_path, &prev_tags_path)?;
+        println!("\n[*] Old tags.db moved to .prevstate/tags.db");
+    }
+    fs::rename(&tmp_tags_path, &real_tags_path)?;
+    
+    println!("[+] Tag bank generation successfully complete.");
+    Ok(())
 }
 
-fn print_scraping_info(page_range: &std::ops::RangeInclusive<u32>, thumbnail: bool) {
-    println!(
-        "[+] Fetching data from page {} to {}",
-        page_range.end(),
-        page_range.start()
-    );
-    if thumbnail {
-        println!("[+] Thumbnail download toggle ON");
+async fn sync_favorites(client: &NhenClient, db: &Database) -> Result<()> {
+    println!("[*] Fetching favorites metadata...");
+    let initial_resp = client.get_favorites_page(1).await?;
+    let total_pages = initial_resp.num_pages;
+
+    println!("[*] Found {} pages. Syncing from oldest to newest...", total_pages);
+    let pb = ProgressBar::new(total_pages as u64);
+
+    let mut added = 0;
+    let mut skipped = 0;
+
+    for page in (1..=total_pages).rev() {
+        let resp = client.get_favorites_page(page).await?;
+        
+        let mut items = resp.result;
+        items.reverse();
+
+        for item in items {
+            if db.fav_exists(item.id)? {
+                skipped += 1;
+                continue;
+            }
+            db.insert_fav(&item)?;
+            added += 1;
+        }
+        pb.inc(1);
     }
-    println!();
+
+    pb.finish();
+    println!("\n[+] Sync Complete! Added: {}, Skipped: {}", added, skipped);
+    Ok(())
+}
+
+async fn download_thumbnails(db: &Database, outpath: &Path) -> Result<()> {
+    let thumb_dir = outpath.join(".thumbnails");
+    fs::create_dir_all(&thumb_dir)?;
+
+    let items = db.get_all_thumbnails()?;
+    println!("[*] Found {} records to check for thumbnails.", items.len());
+
+    let pb = ProgressBar::new(items.len() as u64);
+    pb.set_style(ProgressStyle::with_template("[{bar:40.cyan/blue}] {pos}/{len} ({msg})").unwrap());
+
+    let client = NhenClient::clean_client()?;
+    let mirrors = ["t1", "t2", "t3", "t4", "t5"];
+
+    // Buffer unordered allows 4 concurrent downloads at a time.
+    futures::stream::iter(items)
+        .map(|(nhen_id, thumb_path)| {
+            let thumb_dir = thumb_dir.clone();
+            let client = client.clone();
+            let pb = pb.clone();
+            
+            async move {
+                let ext = thumb_path.split('.').last().unwrap_or("jpg");
+                let dest_path = thumb_dir.join(format!("{}.{}", nhen_id, ext));
+
+                if !dest_path.exists() {
+                    let mut success = false;
+                    for mirror in mirrors {
+                        let url = format!("https://{}.nhentai.net/{}", mirror, thumb_path);
+                        if let Ok(resp) = client.get(&url).send().await {
+                            if resp.status().is_success() {
+                                if let Ok(bytes) = resp.bytes().await {
+                                    let _ = fs::write(&dest_path, bytes);
+                                    success = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !success {
+                        pb.set_message(format!("Failed: {}", nhen_id));
+                    }
+                }
+                pb.inc(1);
+            }
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<()>>()
+        .await;
+
+    pb.finish_with_message("Finished downloading thumbnails.");
+    Ok(())
 }
