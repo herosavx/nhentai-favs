@@ -3,6 +3,7 @@ use rusqlite::{params, Connection};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use crate::models::{FavItem, TagItem};
 
@@ -73,13 +74,51 @@ impl Database {
 
     pub fn export_to_csv(&self) -> Result<()> {
         let csv_path = self.outpath.join("nfavs_export.csv");
+        let tags_db_path = self.outpath.join("tags.db");
+
+        // 1. Check if we have a tagbank to use
+        let mut tagbank: HashMap<u32, TagItem> = HashMap::new();
+        let use_tags = tags_db_path.exists();
+
+        if use_tags {
+            println!("[*] tags.db found! Generating rich CSV with mapped tags...");
+            let tags_conn = Connection::open(&tags_db_path)?;
+            let mut stmt = tags_conn.prepare("SELECT id, type, name, count FROM tags")?;
+            let tag_iter = stmt.query_map([], |row| {
+                Ok(TagItem {
+                    id: row.get(0)?,
+                    tag_type: row.get(1)?,
+                    name: row.get(2)?,
+                    count: row.get(3)?,
+                })
+            })?;
+
+            for tag in tag_iter {
+                if let Ok(t) = tag {
+                    tagbank.insert(t.id, t);
+                }
+            }
+        } else {
+            println!("[*] No tags.db found. Generating basic CSV...");
+        }
+
+        // 2. Prepare the Favorites query
         let mut stmt = self.favs_conn.prepare(
-            "SELECT local_id, nhen_id, english_title, japanese_title, num_pages 
+            "SELECT local_id, nhen_id, english_title, japanese_title, num_pages, tag_ids
              FROM favorites ORDER BY local_id DESC"
         )?;
 
         let mut wtr = csv::Writer::from_path(&csv_path)?;
-        wtr.write_record(&["local_id", "nhen_id", "english_title", "japanese_title", "num_pages"])?;
+
+        // Write Headers dynamically based on tagbank presence
+        if use_tags {
+            wtr.write_record(&[
+                "local_id", "nhen_id", "english_title", "japanese_title", "num_pages",
+                "artists", "groups", "tags", "languages"
+            ])?;
+        } else {
+            wtr.write_record(&["local_id", "nhen_id", "english_title", "japanese_title", "num_pages"])?;
+        }
 
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -88,14 +127,50 @@ impl Database {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
 
+        // 3. Process and write rows
         for row_result in rows {
-            let (lid, nid, eng, jap, pages) = row_result?;
-            wtr.write_record(&[
-                lid.to_string(), nid.to_string(), eng, jap, pages.to_string()
-            ])?;
+            let (lid, nid, eng, jap, pages, tag_ids_str) = row_result?;
+
+            if use_tags {
+                let mut artists = Vec::new();
+                let mut groups = Vec::new();
+                let mut tags = Vec::new();
+                let mut languages = Vec::new();
+
+                for id_str in tag_ids_str.split(',') {
+                    if let Ok(id) = id_str.parse::<u32>() {
+                        if let Some(tag_info) = tagbank.get(&id) {
+                            match tag_info.tag_type.as_str() {
+                                "artist" => artists.push(tag_info.name.clone()),
+                                "group" => groups.push(tag_info.name.clone()),
+                                "tag" => tags.push(tag_info.name.clone()),
+                                "language" => languages.push(tag_info.name.clone()),
+                                _ => {} // Ignore categories we don't care about (like 'category' or 'parody')
+                            }
+                        }
+                    }
+                }
+
+                wtr.write_record(&[
+                    lid.to_string(),
+                    nid.to_string(),
+                    eng,
+                    jap,
+                    pages.to_string(),
+                    artists.join(", "),
+                    groups.join(", "),
+                    tags.join(", "),
+                    languages.join(", ")
+                ])?;
+            } else {
+                wtr.write_record(&[
+                    lid.to_string(), nid.to_string(), eng, jap, pages.to_string()
+                ])?;
+            }
         }
 
         wtr.flush()?;
