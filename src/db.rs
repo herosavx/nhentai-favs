@@ -17,6 +17,11 @@ impl Database {
         let favs_db_path = outpath.join("nfavs.db");
         let favs_conn = Connection::open(&favs_db_path)?;
 
+        favs_conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;"
+        )?;
+
         favs_conn.execute(
             "CREATE TABLE IF NOT EXISTS favorites (
                 local_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,26 +41,27 @@ impl Database {
         })
     }
 
-    pub fn fav_exists(&self, nhen_id: u32) -> Result<bool> {
-        let mut stmt = self.favs_conn.prepare("SELECT 1 FROM favorites WHERE nhen_id = ?1")?;
-        Ok(stmt.exists(params![nhen_id])?)
-    }
+    pub fn insert_favs_batch(&mut self, favs: &[FavItem]) -> Result<()> {
+        let tx = self.favs_conn.transaction()?;
 
-    pub fn insert_fav(&self, fav: &FavItem) -> Result<()> {
-        let tag_ids_str = fav.tag_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        
-        self.favs_conn.execute(
-            "INSERT INTO favorites (nhen_id, english_title, japanese_title, num_pages, thumbnail, tag_ids)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                fav.id,
-                fav.english_title.as_deref().unwrap_or(""),
-                fav.japanese_title.as_deref().unwrap_or(""),
-                fav.num_pages,
-                fav.thumbnail,
-                tag_ids_str
-            ],
-        )?;
+        for fav in favs {
+            let tag_ids_str = fav.tag_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+
+            tx.execute(
+                "INSERT INTO favorites (nhen_id, english_title, japanese_title, num_pages, thumbnail, tag_ids)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    fav.id,
+                    fav.english_title.as_deref().unwrap_or(""),
+                    fav.japanese_title.as_deref().unwrap_or(""),
+                    fav.num_pages,
+                    fav.thumbnail,
+                    tag_ids_str
+                ],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -182,6 +188,17 @@ impl Database {
         let mut stmt = self.favs_conn.prepare("SELECT COUNT(*) FROM favorites")?;
         let count: u32 = stmt.query_row([], |row| row.get(0))?;
         Ok(count)
+    }
+
+    pub fn get_local_id(&self, nhen_id: u32) -> Result<Option<i64>> {
+        let mut stmt = self.favs_conn.prepare("SELECT local_id FROM favorites WHERE nhen_id = ?1")?;
+        let mut rows = stmt.query(params![nhen_id])?;
+
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn backup_nfavs(&self) -> Result<()> {

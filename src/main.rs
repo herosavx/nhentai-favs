@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&args.outpath)?;
     fs::create_dir_all(&args.outpath.join(".prevstate"))?;
 
-    let db = Database::new(&args.outpath)?;
+    let mut db = Database::new(&args.outpath)?;
 
     if args.cvt_csv {
         return db.export_to_csv();
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     // Sync action
     let client = NhenClient::new(&config.api_key)?;
     db.backup_nfavs()?;
-    sync_favorites(&client, &db).await?;
+    sync_favorites(&client, &mut db).await?;
 
     Ok(())
 }
@@ -115,36 +115,117 @@ async fn generate_tags(outpath: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn sync_favorites(client: &NhenClient, db: &Database) -> Result<()> {
+async fn sync_favorites(client: &NhenClient, db: &mut Database) -> Result<()> {
     println!("[*] Fetching favorites metadata...");
     let initial_resp = client.get_favorites_page(1).await?;
     let total_pages = initial_resp.num_pages;
 
-    println!("[*] Found {} pages. Syncing from oldest to newest...", total_pages);
+    println!("[*] Found {} pages. Starting Delta Sync...", total_pages);
+
     let pb = ProgressBar::new(total_pages as u64);
+    pb.set_style(ProgressStyle::with_template("[{bar:40.cyan/blue}] Page {pos}/{len} ({msg})").unwrap());
 
-    let mut added = 0;
-    let mut skipped = 0;
+    let mut new_items_buffer = Vec::new();
+    let mut stopped_early = false;
 
-    for page in (1..=total_pages).rev() {
+    // Scan forward: Page 1 is the newest data. We want to stop as soon as we hit the old data.
+    for page in 1..=total_pages {
+        pb.set_message("Scanning...");
         let resp = client.get_favorites_page(page).await?;
         
-        let mut items = resp.result;
-        items.reverse();
+        let items = resp.result;
+        if items.is_empty() {
+            break;
+        }
+
+        let items_on_page = items.len();
+        let mut known_local_ids = Vec::new();
 
         for item in items {
-            if db.fav_exists(item.id)? {
-                skipped += 1;
-                continue;
+            if let Some(local_id) = db.get_local_id(item.id)? {
+                known_local_ids.push(local_id);
+            } else {
+                new_items_buffer.push(item);
             }
-            db.insert_fav(&item)?;
-            added += 1;
+        }
+
+        // --- CRITICAL LOGIC: OVERLAP DETECTION ---
+        // We require 72% of the page to be "known" items before we even bother checking sequence.
+        // If a page has 25 items, threshold is 18. If it's the last page and has 6 items, threshold is 5.
+        let threshold = (items_on_page as f32 * 0.72).ceil() as usize;
+
+        if known_local_ids.len() >= threshold {
+
+            // --- CRITICAL LOGIC: THE SEQUENCE VALIDATOR ---
+            // Protects against "Mass Bumps" (User unfavoriting and refavoriting old items).
+            // Because we ALWAYS insert oldest->newest, an untouched block of old favorites
+            // will always have STRICTLY DESCENDING local_ids when read from top to bottom of a webpage.
+
+            // If the page has known items, the sequence is at least 1. Otherwise 0.
+            let mut max_sequence = if known_local_ids.is_empty() { 0 } else { 1 };
+            let mut current_sequence = 1;
+
+            for window in known_local_ids.windows(2) {
+                let current = window[0];
+                let next = window[1];
+
+                // Rule 1: 'current' must be greater than 'next' (Descending order).
+                // Rule 2: The gap between them must be <= 3.
+                // Why 3?
+                // Gap of 1 (100 - 99) = Perfect sequence.
+                // Gap of 2 (100 - 98) = 1 item was deleted from the website.
+                // Gap of 3 (100 - 97) = 2 adjacent items were deleted from the website.
+                if current > next && (current - next) <= 3 {
+                    current_sequence += 1;
+                    if current_sequence > max_sequence {
+                        max_sequence = current_sequence;
+                    }
+                } else {
+                    // Sequence broken (either out of order due to a bump, or a massive deletion gap)
+                    current_sequence = 1;
+                }
+            }
+
+            // If our unbroken descending sequence is long enough to meet the threshold,
+            // we are mathematically certain we have hit the untouched "old data" block.
+            if max_sequence >= threshold {
+                pb.set_message(format!("Solid overlap hit (Chain of {} items).", max_sequence));
+                stopped_early = true;
+                pb.inc(1);
+                break;
+            } else {
+                // If we get here, the user likely did a Mass Bump, OR the website deleted 3+ contiguous items.
+                // We fail safely by continuing the scan to the next page.
+                pb.suspend(|| {
+                    println!("\n[*] Warning: Found {} known items on Page {}, but they were fragmented (Max chain: {}). Continuing scan...", known_local_ids.len(), page, max_sequence);
+                });
+            }
         }
         pb.inc(1);
     }
 
-    pb.finish();
-    println!("\n[+] Sync Complete! Added: {}, Skipped: {}", added, skipped);
+    if stopped_early {
+        pb.finish_with_message("Delta sync caught up!");
+    } else {
+        pb.finish_with_message("Full scan complete.");
+    }
+
+    if new_items_buffer.is_empty() {
+        println!("\n[+] Sync Complete! No new favorites found.");
+        return Ok(());
+    }
+
+    println!("\n[*] Reversing chronological order and inserting {} new items...", new_items_buffer.len());
+
+    // --- CHRONOLOGICAL REVERSAL ---
+    // We scraped from Page 1 (Newest) to Page N (Oldest).
+    // To keep our local_id auto-incrementing in chronological order (Oldest -> Newest),
+    // we MUST reverse the buffer before inserting.
+    new_items_buffer.reverse();
+
+    db.insert_favs_batch(&new_items_buffer)?;
+
+    println!("[+] Sync Complete! Successfully added {} new favorites.", new_items_buffer.len());
     Ok(())
 }
 
