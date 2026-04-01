@@ -52,6 +52,9 @@ async fn main() -> Result<()> {
         return db.restore_nfavs();
     }
 
+    // Install the 'ring' crypto provider globally for rustls.
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     if args.thumbnail {
         return download_thumbnails(&db, &args.outpath).await;
     }

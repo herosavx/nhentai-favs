@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::{Client, Response, header};
 use std::time::Duration;
 use tokio::time::sleep;
+use rustls::{ClientConfig, RootCertStore};
 
 use crate::models::{ApiError, FavResponse, TagResponse};
 
@@ -17,15 +18,32 @@ impl NhenClient {
         let auth_val = format!("Key {}", api_key);
         headers.insert(header::AUTHORIZATION, header::HeaderValue::from_str(&auth_val)?);
 
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
         let http = Client::builder()
             .default_headers(headers)
+            .use_preconfigured_tls(tls_config)
             .build()?;
 
         Ok(Self { http })
     }
 
     pub fn clean_client() -> Result<Client> {
-        Ok(Client::builder().build()?)
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(Client::builder()
+            .use_preconfigured_tls(tls_config)
+            .build()?)
     }
 
     async fn handle_response<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
