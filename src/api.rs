@@ -60,8 +60,8 @@ impl NhenClient {
     }
 
     pub async fn get_favorites_page(&self, page: u32) -> Result<FavResponse> {
-        // Limit: 30/min -> 1 every 2s. Targeting ~95% limit means 1 every 2.15s (2150ms).
-        sleep(Duration::from_millis(2150)).await;
+        // Limit: 15/min -> 1 every 4s. Targeting ~98% limit means 1 every 4.08s (4080ms).
+        sleep(Duration::from_millis(4080)).await;
         
         let url = format!("https://nhentai.net/api/v2/favorites?page={}", page);
         let resp = self.http.get(&url).send().await?;
@@ -71,8 +71,8 @@ impl NhenClient {
     }
 
     pub async fn get_tags_page(client: &Client, tag_type: &str, page: u32) -> Result<TagResponse> {
-        // Limit: 60/min -> 1 every 1s. Targeting ~95% limit means 1 every 1.06s (1060ms). No auth.
-        sleep(Duration::from_millis(1060)).await;
+        // Limit: 30/min -> 1 every 2s. Targeting ~98% limit means 1 every 2.04s (2040ms). No auth.
+        sleep(Duration::from_millis(2040)).await;
         
         let url = format!("https://nhentai.net/api/v2/tags/{}?sort=name&page={}&per_page=100", tag_type, page);
         let resp = client.get(&url).send().await?;
